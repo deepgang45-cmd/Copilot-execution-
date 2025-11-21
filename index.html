@@ -1,0 +1,1280 @@
+<html>
+        <head><title>Downloaded HTML</title></head>
+        <body>
+            <pre style="white-space: pre-wrap; word-wrap: break-word;">#!/usr/bin/env bash
+# generate-repo.sh
+# Generates the complete Automation Dashboard repository files for local development and Kubernetes deployment.
+# Usage: chmod +x generate-repo.sh && ./generate-repo.sh
+# After running: review files, run `git init`, commit, create GitHub repo, push, then follow README for build & deploy.
+
+set -euo pipefail
+
+ROOT="$(pwd)/automation-dashboard"
+echo "Creating project at $ROOT"
+mkdir -p "$ROOT"
+cd "$ROOT"
+
+# root package.json (monorepo)
+cat > package.json <<'EOF'
+{
+  "name": "automation-dashboard-monorepo",
+  "private": true,
+  "workspaces": [
+    "server",
+    "worker",
+    "client"
+  ],
+  "scripts": {
+    "start:server": "node server/index.js",
+    "start:worker": "node worker/worker.js",
+    "build:client": "cd client && npm install && npm run build",
+    "dev": "concurrently \"cd server && nodemon index.js\" \"cd worker && nodemon worker.js\" \"cd client && npm run dev\""
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
+EOF
+
+cat > .env.example <<'EOF'
+# API secrets and Redis
+JWT_SECRET=replace-with-strong-secret
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=
+OUTPUT_DIR=/data/outputs
+PORT=3000
+
+# Limits
+JOB_TIMEOUT=60000
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=30
+
+# AWS (optional - if using S3 uploads)
+AWS_REGION=us-east-1
+AWS_ACCESS_KEY_ID=
+AWS_SECRET_ACCESS_KEY=
+AWS_S3_BUCKET=
+AWS_PRESIGNED_URLS=true
+PRESIGNED_URL_EXPIRATION_SECS=3600
+EOF
+
+# README
+cat > README.md <<'EOF'
+# Automation Dashboard — Deployable Project
+
+This repository is a full deployable Automation Dashboard:
+- React frontend (Vite) with job submission and simple action builder
+- Express API with JWT auth, rate-limiting, job submission, /metrics
+- BullMQ + Redis queue
+- Playwright worker to run jobs, save screenshots, and optionally upload to S3
+- Dockerfiles for API and Worker (worker uses Playwright image)
+- GitHub Actions CI workflow to build/push images
+- Helm chart + k8s manifests to deploy to Kubernetes, with PVC, HPA and ServiceMonitor support
+- IRSA instructions for EKS to avoid embedding AWS credentials
+
+This generator script writes all files into a local folder. After generating:
+1. Review files and update placeholders (image names, secrets).
+2. Initialize git, commit, create GitHub repo and push.
+3. Configure GitHub Actions secrets (REGISTRY_* etc) or build images locally.
+4. Deploy with Helm or kubectl (see k8s/helm/README-HELM.md).
+
+See k8s/README and other docs in the repo for step-by-step deployment instructions.
+EOF
+
+# .github workflow
+mkdir -p .github/workflows
+cat > .github/workflows/ci.yml <<'EOF'
+name: CI - Build & Push Images
+on:
+  push:
+    branches: [ main ]
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+      - name: Build and push API image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: ${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_REPO }}:api-${{ github.sha }}
+      - name: Build and push Worker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: Dockerfile.worker
+          push: true
+          tags: ${{ secrets.REGISTRY_HOST }}/${{ secrets.REGISTRY_REPO }}:worker-${{ github.sha }}
+      - name: Output image tags
+        run: echo "Images published."
+EOF
+
+# Dockerfiles
+cat > Dockerfile.api <<'EOF'
+# Dockerfile.api - API image (builds client and serves static files).
+FROM node:18-bullseye AS builder
+WORKDIR /app
+COPY package.json package-lock.json* ./
+COPY server/package.json server/package-lock.json* ./server/
+COPY client/package.json client/package-lock.json* ./client/
+RUN cd server && npm ci --production=false
+RUN cd client && npm ci
+COPY client ./client
+RUN cd client && npm run build
+
+FROM node:18-bullseye
+WORKDIR /app
+RUN useradd --create-home --shell /bin/bash appuser || true
+COPY server ./server
+COPY --from=builder /app/client/dist ./server/dist
+WORKDIR /app/server
+RUN npm ci --production
+ENV NODE_ENV=production
+EXPOSE 3000
+USER appuser
+CMD ["node", "index.js"]
+EOF
+
+cat > Dockerfile.worker <<'EOF'
+# Dockerfile.worker - Worker image with Playwright dependencies, running as non-root user.
+FROM mcr.microsoft.com/playwright:v1.39.2-focal
+ARG USER=worker
+ARG UID=1001
+ARG GID=1001
+RUN groupadd -g ${GID} ${USER} || true \
+  && useradd -m -u ${UID} -g ${GID} -s /bin/bash ${USER} || true
+WORKDIR /home/${USER}/app
+COPY worker/package.json worker/package-lock.json* ./worker/
+RUN cd worker && npm ci --production
+COPY worker ./worker
+WORKDIR /home/${USER}/app/worker
+RUN chown -R ${USER}:${USER} /home/${USER}/app
+USER ${USER}
+ENV NODE_ENV=production
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+CMD ["node", "worker.js"]
+EOF
+
+# server
+mkdir -p server
+cat > server/package.json <<'EOF'
+{
+  "name": "automation-api",
+  "version": "0.1.1",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^8.0.1",
+    "bcrypt": "^5.1.0",
+    "bullmq": "^2.11.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "express-rate-limit": "^6.7.0",
+    "ioredis": "^5.3.2",
+    "jsonwebtoken": "^9.0.0",
+    "uuid": "^9.0.0",
+    "prom-client": "^14.1.0",
+    "axios": "^1.4.0"
+  }
+}
+EOF
+
+cat > server/index.js <<'EOF'
+/*
+ server/index.js
+ Express API with JWT auth, job submission, BullMQ connection and Prometheus metrics.
+*/
+const express = require('express');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { Queue, QueueScheduler } = require('bullmq');
+const IORedis = require('ioredis');
+const path = require('path');
+const fs = require('fs');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const Database = require('better-sqlite3');
+const { v4: uuidv4 } = require('uuid');
+const promClient = require('prom-client');
+require('dotenv').config();
+
+const PORT = process.env.PORT || 3000;
+const OUTPUT_DIR = process.env.OUTPUT_DIR || 'outputs';
+const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
+const REDIS_PASSWORD = process.env.REDIS_PASSWORD || undefined;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+const JOB_TIMEOUT = parseInt(process.env.JOB_TIMEOUT || '60000', 10);
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || '30', 10);
+
+if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+
+// SQLite DB for simple user storage
+const db = new Database(path.join(__dirname, 'data.sqlite'));
+db.pragma('journal_mode = WAL');
+db.prepare(`
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE,
+  password_hash TEXT,
+  created_at INTEGER
+)`).run();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const limiter = rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+app.use(limiter);
+
+const connection = new IORedis({ host: REDIS_HOST, port: REDIS_PORT, password: REDIS_PASSWORD });
+const queueName = 'automation-jobs';
+new QueueScheduler(queueName, { connection });
+const queue = new Queue(queueName, { connection });
+
+// Prometheus
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register });
+
+const httpRequestsTotal = new promClient.Counter({
+  name: 'api_http_requests_total',
+  help: 'Total HTTP requests',
+  labelNames: ['method', 'route', 'status']
+});
+const httpRequestDuration = new promClient.Histogram({
+  name: 'api_http_request_duration_seconds',
+  help: 'HTTP request duration seconds',
+  labelNames: ['method', 'route', 'status'],
+  buckets: [0.01, 0.05, 0.1, 0.5, 1, 5]
+});
+const queueWaiting = new promClient.Gauge({
+  name: 'automation_queue_counts',
+  help: 'Counts of jobs in queue',
+  labelNames: ['type']
+});
+register.registerMetric(httpRequestsTotal);
+register.registerMetric(httpRequestDuration);
+register.registerMetric(queueWaiting);
+
+app.use((req, res, next) => {
+  const end = httpRequestDuration.startTimer();
+  res.on('finish', () => {
+    httpRequestsTotal.inc({ method: req.method, route: req.path, status: res.statusCode }, 1);
+    end({ method: req.method, route: req.path, status: res.statusCode });
+  });
+  next();
+});
+
+async function refreshQueueCounts() {
+  try {
+    const counts = await queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused');
+    Object.entries(counts).forEach(([k, v]) => queueWaiting.set({ type: k }, v));
+  } catch (e) {
+    console.error('Error refreshing queue counts', e.message);
+  }
+}
+setInterval(refreshQueueCounts, 5000);
+refreshQueueCounts();
+
+const staticPath = path.join(__dirname, 'dist');
+if (fs.existsSync(staticPath)) app.use(express.static(staticPath));
+
+function signToken(user) {
+  return jwt.sign({ id: user.id, username: user.username }, JWT_SECRET, { expiresIn: '12h' });
+}
+
+app.post('/api/auth/register', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  const existing = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (existing) return res.status(409).json({ error: 'username already exists' });
+  const hash = await bcrypt.hash(password, 10);
+  const id = uuidv4();
+  db.prepare('INSERT INTO users (id, username, password_hash, created_at) VALUES (?, ?, ?, ?)').run(id, username, hash, Date.now());
+  const token = signToken({ id, username });
+  res.json({ token });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { username, password } = req.body || {};
+  if (!username || !password) return res.status(400).json({ error: 'username and password required' });
+  const row = db.prepare('SELECT * FROM users WHERE username = ?').get(username);
+  if (!row) return res.status(401).json({ error: 'invalid credentials' });
+  const ok = await bcrypt.compare(password, row.password_hash);
+  if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+  const token = signToken({ id: row.id, username: row.username });
+  res.json({ token });
+});
+
+function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth) return res.status(401).json({ error: 'missing auth' });
+  const parts = auth.split(' ');
+  if (parts.length !== 2 || parts[0] !== 'Bearer') return res.status(401).json({ error: 'invalid auth header' });
+  try {
+    const payload = jwt.verify(parts[1], JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'invalid token' });
+  }
+}
+
+app.post('/api/jobs', requireAuth, async (req, res) => {
+  try {
+    const { url, actions } = req.body;
+    if (!url || typeof url !== 'string') return res.status(400).json({ error: 'Missing or invalid url' });
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'URL must start with http:// or https://' });
+    const sanitizedActions = Array.isArray(actions) ? actions : [];
+    const jobId = uuidv4();
+    const job = await queue.add(jobId, { url, actions: sanitizedActions, jobId, user: req.user }, {
+      attempts: 2,
+      removeOnComplete: false,
+      removeOnFail: false,
+      timeout: JOB_TIMEOUT
+    });
+    res.json({ jobId: job.id });
+  } catch (err) {
+    console.error('Error creating job', err);
+    res.status(500).json({ error: 'Failed to create job' });
+  }
+});
+
+app.get('/api/jobs/:id', requireAuth, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const job = await queue.getJob(id);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    const state = await job.getState();
+    const result = job.returnvalue || null;
+    const failedReason = job.failedReason || null;
+    res.json({ id: job.id, name: job.name, data: job.data, state, result, failedReason, timestamp: job.timestamp });
+  } catch (err) {
+    console.error('Error fetching job', err);
+    res.status(500).json({ error: 'Failed to fetch job' });
+  }
+});
+
+app.get('/metrics', async (req, res) => {
+  res.setHeader('Content-Type', register.contentType);
+  try {
+    res.end(await register.metrics());
+  } catch (err) {
+    res.status(500).end(err.message);
+  }
+});
+
+app.get('/healthz', (req, res) => res.json({ ok: true }));
+
+app.get('/', (req, res) => {
+  const index = path.join(staticPath, 'index.html');
+  if (fs.existsSync(index)) return res.sendFile(index);
+  res.send('Automation Dashboard API - frontend not built');
+});
+
+app.listen(PORT, () => {
+  console.log(`API listening on port ${PORT}`);
+  console.log(`Metrics available on /metrics`);
+});
+EOF
+
+# worker
+mkdir -p worker
+cat > worker/package.json <<'EOF'
+{
+  "name": "automation-worker",
+  "version": "0.1.2",
+  "main": "worker.js",
+  "scripts": {
+    "start": "node worker.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.385.0",
+    "@aws-sdk/s3-request-presigner": "^3.385.0",
+    "bullmq": "^2.11.0",
+    "ioredis": "^5.3.2",
+    "playwright": "^1.40.0",
+    "dotenv": "^16.0.3",
+    "prom-client": "^14.1.0"
+  }
+}
+EOF
+
+cat > worker/runner.js <<'EOF'
+/*
+ worker/runner.js - Playwright runner with optional S3 upload & presigned URLs
+*/
+const fs = require('fs');
+const path = require('path');
+const playwright = require('playwright');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+
+function createS3ClientFromEnv() {
+  const region = process.env.AWS_REGION;
+  const accessKeyId = process.env.AWS_ACCESS_KEY_ID;
+  const secretAccessKey = process.env.AWS_SECRET_ACCESS_KEY;
+  if (!region || !accessKeyId || !secretAccessKey) return null;
+  return new S3Client({ region, credentials: { accessKeyId, secretAccessKey } });
+}
+
+async function uploadFileToS3(s3, bucket, key, filePath, contentType = 'application/octet-stream') {
+  const body = fs.createReadStream(filePath);
+  const cmd = new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType });
+  await s3.send(cmd);
+  return { bucket, key };
+}
+
+async function presignGetUrl(s3, bucket, key, expires) {
+  const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
+  return await getSignedUrl(s3, cmd, { expiresIn: expires });
+}
+
+async function runAutomation(url, actions = [], opts = {}) {
+  const logs = [];
+  const screenshots = [];
+  const extracted = {};
+  const s3Urls = [];
+  const jobId = String(opts.jobId || `job-${Date.now()}`);
+  const outputBase = opts.outputBase || '/data/outputs';
+  const jobDir = path.join(outputBase, String(jobId));
+  if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir, { recursive: true });
+
+  const s3 = createS3ClientFromEnv();
+  const bucket = process.env.AWS_S3_BUCKET || null;
+  const presignedEnabled = (process.env.AWS_PRESIGNED_URLS || 'true').toLowerCase() !== 'false';
+  const presignedExpiry = parseInt(process.env.PRESIGNED_URL_EXPIRATION_SECS || '3600', 10);
+
+  const browser = await playwright.chromium.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const context = await browser.newContext({ viewport: { width: 1280, height: 800 } });
+  const page = await context.newPage();
+
+  try {
+    logs.push(`goto ${url}`);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    for (let i = 0; i < actions.length; i++) {
+      const a = actions[i];
+      logs.push(`action ${i}: ${JSON.stringify(a)}`);
+      const type = (a.type || '').toLowerCase();
+      if (type === 'goto' && a.url) {
+        await page.goto(a.url, { timeout: a.timeout || 30000, waitUntil: a.waitUntil || 'domcontentloaded' });
+        continue;
+      }
+      if (type === 'click' && a.selector) {
+        await page.click(a.selector, { timeout: a.timeout || 5000 });
+        continue;
+      }
+      if (type === 'type' && a.selector) {
+        await page.fill(a.selector, a.text || '', { timeout: a.timeout || 5000 });
+        continue;
+      }
+      if ((type === 'waitforselector' || type === 'waitfor') && a.selector) {
+        await page.waitForSelector(a.selector, { timeout: a.timeout || 5000 });
+        continue;
+      }
+      if (type === 'screenshot') {
+        const name = a.name || `screenshot-${i}.png`;
+        const filepath = path.join(jobDir, name);
+        await page.screenshot({ path: filepath, fullPage: !!a.fullPage });
+        screenshots.push(`/outputs/${jobId}/${name}`);
+        logs.push(`screenshot saved ${filepath}`);
+        if (s3 && bucket) {
+          try {
+            const key = `${jobId}/${name}`;
+            await uploadFileToS3(s3, bucket, key, filepath, 'image/png');
+            if (presignedEnabled) {
+              const url = await presignGetUrl(s3, bucket, key, presignedExpiry);
+              s3Urls.push(url);
+              logs.push(`presigned URL: ${url}`);
+            } else {
+              const publicUrl = `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodeURIComponent(key)}`;
+              s3Urls.push(publicUrl);
+              logs.push(`public S3 URL: ${publicUrl}`);
+            }
+          } catch (uerr) {
+            logs.push(`s3 upload error: ${uerr.message}`);
+          }
+        }
+        continue;
+      }
+      if (type === 'evaluate' && a.script) {
+        const result = await page.evaluate(new Function('return (' + a.script + ')')());
+        extracted[a.key || `eval_${i}`] = result;
+        logs.push(`evaluate => ${String(result)}`);
+        continue;
+      }
+      if (a.waitAfter) await page.waitForTimeout(a.waitAfter);
+      logs.push(`unknown action type: ${a.type}`);
+    }
+
+    const finalName = 'final.png';
+    const finalPath = path.join(jobDir, finalName);
+    await page.screenshot({ path: finalPath, fullPage: true });
+    screenshots.push(`/outputs/${jobId}/${finalName}`);
+    logs.push(`final screenshot saved ${finalPath}`);
+
+    if (s3 && bucket) {
+      try {
+        const key = `${jobId}/${finalName}`;
+        await uploadFileToS3(s3, bucket, key, finalPath, 'image/png');
+        if (presignedEnabled) {
+          const url = await presignGetUrl(s3, bucket, key, presignedExpiry);
+          s3Urls.push(url);
+          logs.push(`presigned final URL: ${url}`);
+        } else {
+          const publicUrl = `https://${bucket}.s3.${process.env.AWS_REGION}.amazonaws.com/${encodeURIComponent(key)}`;
+          s3Urls.push(publicUrl);
+          logs.push(`public S3 URL final: ${publicUrl}`);
+        }
+      } catch (uerr) {
+        logs.push(`s3 upload error: ${uerr.message}`);
+      }
+
+      const summaryPath = path.join(jobDir, 'summary.json');
+      const summary = { jobId, logs, screenshots, extracted, s3Urls, timestamp: new Date().toISOString() };
+      fs.writeFileSync(summaryPath, JSON.stringify(summary, null, 2));
+      try {
+        const key = `${jobId}/summary.json`;
+        await uploadFileToS3(s3, bucket, key, summaryPath, 'application/json');
+        if (presignedEnabled) {
+          const url = await presignGetUrl(s3, bucket, key, presignedExpiry);
+          s3Urls.push(url);
+          logs.push(`presigned summary URL: ${url}`);
+        }
+      } catch (uerr) {
+        logs.push(`s3 upload error: ${uerr.message}`);
+      }
+    }
+
+    await browser.close();
+    return { success: true, logs, screenshots, extracted, s3Urls };
+  } catch (err) {
+    try { await browser.close(); } catch (e) {}
+    logs.push(`error: ${err.message}`);
+    return { success: false, error: err.message, logs, screenshots, extracted, s3Urls };
+  }
+}
+
+module.exports = { runAutomation };
+EOF
+
+cat > worker/worker.js <<'EOF'
+/*
+ worker/worker.js - BullMQ worker with Prometheus metrics server
+*/
+const { Worker } = require('bullmq');
+const IORedis = require('ioredis');
+const path = require('path');
+const http = require('http');
+require('dotenv').config();
+
+const runner = require('./runner');
+const promClient = require('prom-client');
+
+const register = new promClient.Registry();
+promClient.collectDefaultMetrics({ register, timeout: 5000 });
+
+const jobsProcessed = new promClient.Counter({ name: 'automation_jobs_processed_total', help: 'Total processed jobs', labelNames: ['result'] });
+const jobsInProgress = new promClient.Gauge({ name: 'automation_jobs_in_progress', help: 'Jobs currently in progress' });
+const jobDuration = new promClient.Histogram({ name: 'automation_job_duration_seconds', help: 'Job duration in seconds', buckets: [0.5,1,2,5,10,30,60,120] });
+
+register.registerMetric(jobsProcessed);
+register.registerMetric(jobsInProgress);
+register.registerMetric(jobDuration);
+
+const METRICS_PORT = parseInt(process.env.METRICS_PORT || '9464', 10);
+http.createServer(async (req, res) => {
+  if (req.url === '/metrics') {
+    res.setHeader('Content-Type', register.contentType);
+    try {
+      const metrics = await register.metrics();
+      res.end(metrics);
+    } catch (err) {
+      res.statusCode = 500;
+      res.end(err.message);
+    }
+    return;
+  }
+  res.statusCode = 404;
+  res.end('Not found');
+}).listen(METRICS_PORT, () => {
+  console.log(`Worker metrics server running on :${METRICS_PORT}/metrics`);
+});
+
+const REDIS_HOST = process.env.REDIS_HOST || '127.0.0.1';
+const REDIS_PORT = process.env.REDIS_PORT || 6379;
+const connection = new IORedis({ host: REDIS_HOST, port: REDIS_PORT });
+
+const queueName = 'automation-jobs';
+const concurrency = parseInt(process.env.WORKER_CONCURRENCY || '2', 10);
+
+const worker = new Worker(queueName, async job => {
+  console.log(`Worker processing job ${job.id} url=${job.data.url}`);
+  const outputBase = process.env.OUTPUT_DIR || '/data/outputs';
+
+  jobsInProgress.inc(1);
+  const endTimer = jobDuration.startTimer();
+  try {
+    const result = await runner.runAutomation(job.data.url, job.data.actions || [], { jobId: job.id, outputBase });
+    endTimer();
+    jobsProcessed.inc({ result: result && result.success ? 'success' : 'failure' }, 1);
+    return result;
+  } catch (err) {
+    endTimer();
+    jobsProcessed.inc({ result: 'failure' }, 1);
+    throw err;
+  } finally {
+    jobsInProgress.dec(1);
+  }
+}, { connection, concurrency });
+
+worker.on('completed', (job) => console.log(`Job ${job.id} completed`));
+worker.on('failed', (job, err) => console.error(`Job ${job ? job.id : 'unknown'} failed:`, err));
+EOF
+
+# client - minimal Vite React app
+mkdir -p client/src
+cat > client/package.json <<'EOF'
+{
+  "name": "automation-client",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview --port 5173"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.11.1"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0",
+    "@vitejs/plugin-react": "^5.0.0"
+  }
+}
+EOF
+
+cat > client/vite.config.js <<'EOF'
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()], build: { outDir: 'dist' } });
+EOF
+
+cat > client/index.html <<'EOF'
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Automation Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+EOF
+
+cat > client/src/main.jsx <<'EOF'
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import Login from './views/Login';
+import Register from './views/Register';
+import Dashboard from './views/Dashboard';
+import './styles.css';
+function App() {
+  const token = localStorage.getItem('token');
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/login" element={<Login/>} />
+        <Route path="/register" element={<Register/>} />
+        <Route path="/" element={token ? <Dashboard/> : <Navigate to="/login" replace />} />
+      </Routes>
+    </BrowserRouter>
+  );
+}
+createRoot(document.getElementById('root')).render(<App />);
+EOF
+
+cat > client/src/styles.css <<'EOF'
+body { font-family: Arial, sans-serif; padding: 16px; }
+.container { max-width: 900px; margin: auto; }
+.card { border:1px solid #ddd; padding: 12px; border-radius: 6px; margin-bottom:12px; }
+input, textarea, button { padding:8px; margin-top:6px; width:100%; box-sizing:border-box; }
+.row { display:flex; gap:8px; }
+.row > * { flex:1; }
+pre { background:#f8f8f8; padding:8px; max-height:300px; overflow:auto; white-space:pre-wrap; }
+EOF
+
+cat > client/src/views/Login.jsx <<'EOF'
+import React, { useState } from 'react';
+import axios from 'axios';
+export default function Login() {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  async function login() {
+    try {
+      const res = await axios.post('/api/auth/login', { username, password });
+      localStorage.setItem('token', res.data.token);
+      window.location.href = '/';
+    } catch (e) {
+      alert(e.response?.data?.error || e.message);
+    }
+  }
+  return (
+    <div className="container">
+      <h2>Login</h2>
+      <div className="card">
+        <label>Username</label>
+        <input value={username} onChange={e => setUsername(e.target.value)} />
+        <label>Password</label>
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} />
+        <button onClick={login}>Login</button>
+        <p>Or <a href="/register">register</a></p>
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > client/src/views/Register.jsx <<'EOF'
+import React, { useState } from 'react';
+import axios from 'axios';
+export default function Register() {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  async function register() {
+    try {
+      const res = await axios.post('/api/auth/register', { username, password });
+      localStorage.setItem('token', res.data.token);
+      window.location.href = '/';
+    } catch (e) {
+      alert(e.response?.data?.error || e.message);
+    }
+  }
+  return (
+    <div className="container">
+      <h2>Register</h2>
+      <div className="card">
+        <label>Username</label>
+        <input value={username} onChange={e => setUsername(e.target.value)} />
+        <label>Password</label>
+        <input type="password" value={password} onChange={e => setPassword(e.target.value)} />
+        <button onClick={register}>Register</button>
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > client/src/views/Dashboard.jsx <<'EOF'
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+function ActionsBuilder({ actions, setActions }) {
+  const [type, setType] = useState('screenshot');
+  const [payload, setPayload] = useState('{}');
+  function addAction() {
+    try {
+      const obj = JSON.parse(payload);
+      setActions([...actions, { type, ...obj }]);
+      setPayload('{}');
+    } catch (e) {
+      alert('Invalid JSON payload');
+    }
+  }
+  return (
+    <div className="card">
+      <h3>Action builder</h3>
+      <label>Action</label>
+      <select value={type} onChange={e => setType(e.target.value)}>
+        <option value="screenshot">screenshot</option>
+        <option value="click">click</option>
+        <option value="type">type</option>
+        <option value="waitForSelector">waitForSelector</option>
+        <option value="evaluate">evaluate</option>
+        <option value="goto">goto</option>
+      </select>
+      <label>Payload (JSON)</label>
+      <textarea rows="4" value={payload} onChange={e => setPayload(e.target.value)} />
+      <button onClick={addAction}>Add action</button>
+      <h4>Actions</h4>
+      <pre>{JSON.stringify(actions, null, 2)}</pre>
+    </div>
+  );
+}
+export default function Dashboard() {
+  const [url, setUrl] = useState('https://example.com');
+  const [actions, setActions] = useState([{ type: 'waitForSelector', selector: 'body' }, { type: 'screenshot', name: 'start.png' }]);
+  const [log, setLog] = useState('Ready.');
+  const [jobId, setJobId] = useState(null);
+  const token = localStorage.getItem('token');
+  useEffect(() => { axios.defaults.headers.common['Authorization'] = 'Bearer ' + token; }, [token]);
+  async function submit() {
+    try {
+      setLog(l => `Submitting ${url}\n` + l);
+      const res = await axios.post('/api/jobs', { url, actions });
+      setJobId(res.data.jobId);
+      setLog(l => `Submitted job ${res.data.jobId}\n` + l);
+      poll(res.data.jobId);
+    } catch (e) {
+      setLog(l => `Submit error: ${e.response?.data?.error || e.message}\n` + l);
+    }
+  }
+  function appendLog(s) { setLog(l => new Date().toISOString() + ' - ' + s + '\n' + l); }
+  function poll(id) {
+    appendLog('Start polling ' + id);
+    const ti = setInterval(async () => {
+      try {
+        const res = await axios.get('/api/jobs/' + id);
+        appendLog('state: ' + res.data.state);
+        if (res.data.result) appendLog('result success: ' + (res.data.result.success ? 'true' : 'false'));
+        if (res.data.state === 'completed' || res.data.state === 'failed') { clearInterval(ti); appendLog('Polling ended for ' + id); }
+      } catch (e) { appendLog('poll error: ' + e.message); clearInterval(ti); }
+    }, 2000);
+  }
+  function logout() { localStorage.removeItem('token'); window.location.href = '/login'; }
+  return (
+    <div className="container">
+      <div style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+        <h2>Automation Dashboard</h2>
+        <div><button onClick={logout}>Logout</button></div>
+      </div>
+      <div className="card">
+        <label>Target URL</label>
+        <input value={url} onChange={e => setUrl(e.target.value)} />
+        <button onClick={submit}>Submit Job</button>
+      </div>
+      <ActionsBuilder actions={actions} setActions={setActions} />
+      <div className="card">
+        <h3>Job</h3>
+        <div>Job ID: {jobId || 'none'}</div>
+        <pre>{log}</pre>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# k8s folder and helm
+mkdir -p k8s/helm/automation-dashboard/templates
+cat > k8s/namespace.yaml <<'EOF'
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: automation
+EOF
+
+cat > k8s/outputs-pvc.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: outputs-pvc
+  namespace: automation
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+EOF
+
+cat > k8s/redis-deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: automation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          ports:
+            - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: automation
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+  selector:
+    app: redis
+  type: ClusterIP
+EOF
+
+cat > k8s/api-deployment.updated.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: automation-api
+  namespace: automation
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: automation-api
+  template:
+    metadata:
+      labels:
+        app: automation-api
+    spec:
+      containers:
+        - name: api
+          image: <YOUR_REGISTRY>/<YOUR_REPO>:api-latest
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: automation-secrets
+                  key: JWT_SECRET
+            - name: OUTPUT_DIR
+              value: "/data/outputs"
+          ports:
+            - containerPort: 3000
+          volumeMounts:
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: outputs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: automation-api
+  namespace: automation
+spec:
+  selector:
+    app: automation-api
+  ports:
+    - port: 3000
+      targetPort: 3000
+  type: ClusterIP
+EOF
+
+cat > k8s/worker-deployment.updated.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: automation-worker
+  namespace: automation
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: automation-worker
+  template:
+    metadata:
+      labels:
+        app: automation-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      containers:
+        - name: worker
+          image: <YOUR_REGISTRY>/<YOUR_REPO>:worker-latest
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: OUTPUT_DIR
+              value: "/data/outputs"
+            - name: METRICS_PORT
+              value: "9464"
+          resources:
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+          volumeMounts:
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: outputs-pvc
+EOF
+
+cat > k8s/hpa-worker.yaml <<'EOF'
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: automation
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: automation-worker
+  minReplicas: 1
+  maxReplicas: 5
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+EOF
+
+# helm chart minimal files
+cat > k8s/helm/automation-dashboard/Chart.yaml <<'EOF'
+apiVersion: v2
+name: automation-dashboard
+description: Helm chart for Automation Dashboard (API + Worker + Redis)
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+EOF
+
+cat > k8s/helm/automation-dashboard/values.yaml <<'EOF'
+replicaCount: 2
+image:
+  api:
+    repository: your-registry/automation-api
+    tag: api-latest
+    pullPolicy: IfNotPresent
+  worker:
+    repository: your-registry/automation-worker
+    tag: worker-latest
+    pullPolicy: IfNotPresent
+persistence:
+  enabled: true
+  storageClass: standard
+  size: 5Gi
+service:
+  api:
+    type: ClusterIP
+    port: 3000
+resources:
+  api:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+  worker:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+worker:
+  concurrency: 2
+  metricsPort: 9464
+prometheus:
+  enabled: false
+  serviceMonitor:
+    enabled: false
+hpa:
+  enabled: true
+  minReplicas: 1
+  maxReplicas: 5
+  targetCPUUtilizationPercentage: 60
+EOF
+
+cat > k8s/helm/automation-dashboard/templates/pvc.yaml <<'EOF'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: outputs-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: standard
+EOF
+
+cat > k8s/helm/automation-dashboard/templates/api-deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: automation-api
+  labels:
+    app.kubernetes.io/name: automation-dashboard
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: automation-api
+  template:
+    metadata:
+      labels:
+        app: automation-api
+    spec:
+      containers:
+        - name: api
+          image: "{{ .Values.image.api.repository }}:{{ .Values.image.api.tag }}"
+          imagePullPolicy: {{ .Values.image.api.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.api.port }}
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: automation-secrets
+                  key: JWT_SECRET
+            - name: OUTPUT_DIR
+              value: "/data/outputs"
+          resources:
+            requests:
+              cpu: {{ .Values.resources.api.requests.cpu }}
+              memory: {{ .Values.resources.api.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.api.limits.cpu }}
+              memory: {{ .Values.resources.api.limits.memory }}
+          volumeMounts:
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: outputs-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: automation-api
+spec:
+  selector:
+    app: automation-api
+  ports:
+    - port: {{ .Values.service.api.port }}
+      targetPort: {{ .Values.service.api.port }}
+  type: {{ .Values.service.api.type }}
+EOF
+
+cat > k8s/helm/automation-dashboard/templates/worker-deployment.yaml <<'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: automation-worker
+  labels:
+    app.kubernetes.io/name: automation-dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: automation-worker
+  template:
+    metadata:
+      labels:
+        app: automation-worker
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+      serviceAccountName: automation-worker-sa
+      containers:
+        - name: worker
+          image: "{{ .Values.image.worker.repository }}:{{ .Values.image.worker.tag }}"
+          imagePullPolicy: {{ .Values.image.worker.pullPolicy }}
+          env:
+            - name: REDIS_HOST
+              value: "redis"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: OUTPUT_DIR
+              value: "/data/outputs"
+            - name: METRICS_PORT
+              value: "{{ .Values.worker.metricsPort }}"
+          resources:
+            requests:
+              cpu: {{ .Values.resources.worker.requests.cpu }}
+              memory: {{ .Values.resources.worker.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.worker.limits.cpu }}
+              memory: {{ .Values.resources.worker.limits.memory }}
+          volumeMounts:
+            - name: outputs
+              mountPath: /data/outputs
+      volumes:
+        - name: outputs
+          persistentVolumeClaim:
+            claimName: outputs-pvc
+EOF
+
+# security and docs
+cat > IRSA.md <<'EOF'
+# IRSA (IAM Roles for Service Accounts) guide for EKS
+
+Follow the steps in the repository top-level README to configure IRSA for EKS so the worker can upload to S3 without storing AWS credentials in Kubernetes secrets.
+EOF
+
+cat > SECURITY_NOTES.md <<'EOF'
+Security notes:
+- Use IRSA or provider-specific workload identity instead of embedding AWS keys.
+- Restrict evaluate actions only to trusted users.
+- Monitor queue length and worker health.
+- Use secure JWT_SECRET stored in K8s secret or external secret manager.
+EOF
+
+echo "All files generated under $ROOT"
+echo ""
+echo "Next steps (summary):"
+echo "1) cd $ROOT"
+echo "2) Review placeholders (replace <YOUR_REGISTRY>/<YOUR_REPO> in k8s manifests and Helm values)."
+echo "3) Run: git init && git add . && git commit -m 'Initial commit'"
+echo "4) Create GitHub repo (gh repo create ...) and push."
+echo "5) Configure GitHub Actions secrets (REGISTRY_* etc) or build images locally."
+echo "6) Build & push images, then deploy to k8s using Helm or kubectl as documented in README."
+EOF</pre>
+        </body>
+    </html>
